@@ -1,0 +1,274 @@
+import os
+import io
+import shutil
+import zipfile
+import traceback
+import fitz  # PyMuPDF
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import FileResponse
+from PIL import Image
+import pdf2docx
+import pdfplumber
+import pandas as pd
+from pptx import Presentation
+from pptx.util import Inches
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="Bi-Directional Pure Python Conversion Engine")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+@app.get("/health")
+@app.get("/api/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "service": "conversion-engine",
+        "engine": "python",
+        "supported_conversions": {
+            "pdf": ["docx", "doc", "xlsx", "xls", "pptx", "ppt"]
+        },
+        "supported_compressions": ["pdf", "jpg", "jpeg", "png", "webp", "docx", "pptx", "xlsx"]
+    }
+
+UPLOAD_DIR = "./uploads"
+OUTPUT_DIR = "./outputs"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# -------------------------------------------------------------
+# CONVERSION ROUTINES
+# -------------------------------------------------------------
+
+def pdf_to_docx(input_path: str, output_path: str):
+    cv = pdf2docx.Converter(input_path)
+    cv.convert(output_path, start=0, end=None)
+    cv.close()
+    return output_path
+
+def pdf_to_excel(input_path: str, output_path: str):
+    all_tables = []
+    with pdfplumber.open(input_path) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            tables = page.extract_tables()
+            if not tables:
+                tables = page.extract_tables(table_settings={
+                    "vertical_strategy": "text",
+                    "horizontal_strategy": "text",
+                    "snap_tolerance": 3,
+                    "join_tolerance": 3,
+                })
+            
+            for t_idx, table in enumerate(tables):
+                if not table or len(table) < 1:
+                    continue
+                
+                cleaned_rows = []
+                for row in table:
+                    if row and any(cell is not None and str(cell).strip() != "" for cell in row):
+                        cleaned_rows.append([str(cell).strip() if cell is not None else "" for cell in row])
+                
+                if not cleaned_rows:
+                    continue
+                
+                first_row = cleaned_rows[0]
+                num_cols = len(first_row)
+                
+                headers = []
+                seen_headers = {}
+                for idx in range(num_cols):
+                    raw_val = first_row[idx] if idx < len(first_row) else ""
+                    val = raw_val if raw_val != "" else f"Column_{idx + 1}"
+                    if val in seen_headers:
+                        seen_headers[val] += 1
+                        val = f"{val}_{seen_headers[val]}"
+                    else:
+                        seen_headers[val] = 1
+                    headers.append(val)
+                
+                data_rows = cleaned_rows[1:] if len(cleaned_rows) > 1 else []
+                aligned_data = []
+                for row in data_rows:
+                    if len(row) < num_cols:
+                        row = row + [""] * (num_cols - len(row))
+                    elif len(row) > num_cols:
+                        row = row[:num_cols]
+                    aligned_data.append(row)
+                
+                df = pd.DataFrame(aligned_data, columns=headers)
+                all_tables.append((f"Page_{page_num+1}_T{t_idx+1}", df))
+
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        if all_tables:
+            for idx, (sheet_title, df) in enumerate(all_tables):
+                safe_title = sheet_title[:31]
+                df.to_excel(writer, sheet_name=safe_title, index=False)
+        else:
+            raw_lines = []
+            with pdfplumber.open(input_path) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text:
+                        for line in text.split("\n"):
+                            if line.strip():
+                                raw_lines.append([line.strip()])
+            if raw_lines:
+                df = pd.DataFrame(raw_lines, columns=["Extracted Text"])
+                df.to_excel(writer, sheet_name="Extracted Data", index=False)
+            else:
+                pd.DataFrame({"Note": ["No extractable data found in PDF"]}).to_excel(writer, sheet_name="Sheet1", index=False)
+
+    return output_path
+
+def pdf_to_pptx(input_path: str, output_path: str):
+    doc = fitz.open(input_path)
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    blank_layout = prs.slide_layouts if len(prs.slide_layouts) > 6 else prs.slide_layouts
+
+    for page_num in range(len(doc)):
+        page = doc.load_page(page_num)
+        pix = page.get_pixmap(dpi=150)
+        temp_img_path = os.path.join(UPLOAD_DIR, f"temp_page_{page_num}.png")
+        pix.save(temp_img_path)
+
+        slide = prs.slides.add_slide(blank_layout)
+        slide.shapes.add_picture(temp_img_path, 0, 0, width=prs.slide_width, height=prs.slide_height)
+        
+        if os.path.exists(temp_img_path):
+            os.remove(temp_img_path)
+
+    prs.save(output_path)
+    doc.close()
+    return output_path
+
+# -------------------------------------------------------------
+# COMPRESSION ROUTINES
+# -------------------------------------------------------------
+
+def compress_pdf(input_path: str, output_path: str, dpi: int = 100):
+    doc = fitz.open(input_path)
+    opt_doc = fitz.open()
+
+    for page in doc:
+        pix = page.get_pixmap(dpi=dpi)
+        img_bytes = pix.tobytes("jpeg", quality=70)
+        
+        new_page = opt_doc.new_page(width=page.rect.width, height=page.rect.height)
+        new_page.insert_image(page.rect, stream=img_bytes)
+
+    opt_doc.save(output_path, garbage=4, deflate=True)
+    doc.close()
+    opt_doc.close()
+    return output_path
+
+def resize_image(input_path: str, output_path: str, max_width: int = 1920, quality: int = 75):
+    with Image.open(input_path) as img:
+        img = img.convert("RGB")
+        if img.width > max_width:
+            ratio = max_width / float(img.width)
+            new_height = int(float(img.height) * float(ratio))
+            img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+        img.save(output_path, "JPEG", optimize=True, quality=quality)
+    return output_path
+
+def compress_office_file(input_path: str, output_path: str, max_width: int = 1920, quality: int = 70):
+    with zipfile.ZipFile(input_path, 'r') as in_zip, zipfile.ZipFile(output_path, 'w', compression=zipfile.ZIP_DEFLATED) as out_zip:
+        for item in in_zip.infolist():
+            data = in_zip.read(item.filename)
+            ext = os.path.splitext(item.filename).lower()
+            if ext in ['.jpg', '.jpeg', '.png', '.webp']:
+                try:
+                    img = Image.open(io.BytesIO(data))
+                    img = img.convert("RGB")
+                    if img.width > max_width:
+                        ratio = max_width / float(img.width)
+                        new_height = int(float(img.height) * float(ratio))
+                        img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+                    
+                    img_byte_arr = io.BytesIO()
+                    img.save(img_byte_arr, format='JPEG', optimize=True, quality=quality)
+                    data = img_byte_arr.getvalue()
+                except Exception:
+                    pass
+            out_zip.writestr(item, data)
+    return output_path
+
+# -------------------------------------------------------------
+# API ROUTES
+# -------------------------------------------------------------
+
+@app.post("/api/convert")
+async def convert_file(file: UploadFile = File(...), target_format: str = Form(...)):
+    base_name, ext = os.path.splitext(file.filename)
+    ext = ext.lower()
+    target_format = target_format.strip(". ").lower()
+
+    input_path = os.path.join(UPLOAD_DIR, file.filename)
+    output_path = os.path.join(OUTPUT_DIR, f"{base_name}.{target_format}")
+
+    with open(input_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    try:
+        if ext == ".pdf" and target_format in ["doc", "docx"]:
+            pdf_to_docx(input_path, output_path)
+        elif ext == ".pdf" and target_format in ["xls", "xlsx"]:
+            pdf_to_excel(input_path, output_path)
+        elif ext == ".pdf" and target_format in ["ppt", "pptx"]:
+            pdf_to_pptx(input_path, output_path)
+        else:
+            raise HTTPException(status_code=400, detail=f"Conversion from {ext} to {target_format} not supported.")
+
+        return FileResponse(output_path, filename=os.path.basename(output_path))
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/compress")
+async def compress_file(
+    file: UploadFile = File(...), 
+    max_width: int = Form(1920)
+):
+    base_name, ext = os.path.splitext(file.filename)
+    ext = ext.lower()
+
+    input_path = os.path.join(UPLOAD_DIR, file.filename)
+    output_path = os.path.join(OUTPUT_DIR, f"compressed_{file.filename}")
+
+    with open(input_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    try:
+        if ext == ".pdf":
+            compress_pdf(input_path, output_path)
+        elif ext in [".jpg", ".jpeg", ".png", ".webp"]:
+            output_path = os.path.join(OUTPUT_DIR, f"compressed_{base_name}.jpg")
+            resize_image(input_path, output_path, max_width=max_width)
+        elif ext in [".pptx", ".docx", ".xlsx"]:
+            compress_office_file(input_path, output_path, max_width=max_width)
+        else:
+            raise HTTPException(status_code=400, detail=f"Compression not supported for {ext} files.")
+
+        return FileResponse(output_path, filename=os.path.basename(output_path))
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
